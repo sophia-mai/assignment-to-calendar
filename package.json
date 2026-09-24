@@ -1,0 +1,25 @@
+{
+  "name": "assignment-to-calendar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --test-scheduled",
+    "check": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "db:local": "wrangler d1 migrations apply DB --local",
+    "db:remote": "wrangler d1 migrations apply DB --remote",
+    "deploy": "wrangler deploy",
+    "telegram:register": "node scripts/register-webhook.mjs"
+  },
+  "dependencies": {
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260918.1",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "wrangler": "^4.0.0"
+  }
+}
