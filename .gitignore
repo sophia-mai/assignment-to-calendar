@@ -2,7 +2,33 @@ node_modules/
 .wrangler/
 dist/
 .dev.vars
+.dev.vars.*
+!.dev.vars.example
 .env
 .env.*
 !.env.example
 *.log
+
+# Personal deployment configuration and private working material
+wrangler.local.jsonc
+private/
+backups/
+exports/
+*.sqlite
+*.sqlite3
+*.db
+*.sqlite-wal
+*.sqlite-shm
+*.db-wal
+*.db-shm
+*.sql.gz
+*.dump
+
+# Downloaded credentials and private keys
+credentials*.json
+client_secret*.json
+service-account*.json
+*.pem
+*.key
+*.p12
+*.pfx

@@ -6,6 +6,8 @@ import type { Env } from '../src/types.ts';
 export function fixture() {
   const sql = new DatabaseSync(':memory:');
   sql.exec(readFileSync(new URL('../migrations/0001_initial.sql', import.meta.url), 'utf8'));
+  sql.exec(readFileSync(new URL('../migrations/0002_calendar_context.sql', import.meta.url), 'utf8'));
+  sql.exec(readFileSync(new URL('../migrations/0003_calendar_toggle_receipt.sql', import.meta.url), 'utf8'));
   function prepare(query: string) {
     let values: unknown[] = [];
     const execute = () => sql.prepare(query);

@@ -3,6 +3,8 @@ import { UserError, RetryLater } from './types.ts';
 import { getSetting, setSetting } from './db.ts';
 import { addDays, localInstant } from './time.ts';
 
+export const GOOGLE_SCOPES = ['calendar.app.created', 'calendar.events.owned', 'calendar.calendarlist.readonly'].map(scope => `https://www.googleapis.com/auth/${scope}`);
+
 function base64(bytes: Uint8Array): string { return btoa(String.fromCharCode(...bytes)); }
 function unbase64(value: string): Uint8Array { return Uint8Array.from(atob(value), c => c.charCodeAt(0)); }
 
@@ -38,7 +40,7 @@ export async function oauthStart(env: Env, state: string) {
   const row = await env.DB.prepare('UPDATE oauth_states SET started=1 WHERE state=? AND expires_at>? AND started=0 RETURNING state').bind(state, Date.now()).first();
   if (!row) return new Response('Link expired or already used. Send /connect to the bot for a new link.', { status: 400 });
   const url = new URL('https://accounts.google.com/o/oauth2/v2/auth');
-  url.search = new URLSearchParams({ client_id: env.GOOGLE_CLIENT_ID, redirect_uri: `${env.PUBLIC_BASE_URL}/oauth/callback`, response_type: 'code', scope: 'https://www.googleapis.com/auth/calendar.app.created', access_type: 'offline', prompt: 'consent', state }).toString();
+  url.search = new URLSearchParams({ client_id: env.GOOGLE_CLIENT_ID, redirect_uri: `${env.PUBLIC_BASE_URL}/oauth/callback`, response_type: 'code', scope: GOOGLE_SCOPES.join(' '), access_type: 'offline', prompt: 'consent', state }).toString();
   return Response.redirect(url.toString(), 302);
 }
 
@@ -67,8 +69,8 @@ export async function accessToken(env: Env) {
   return tokens.access_token;
 }
 
-async function calendarRequest(token: string, path: string, method = 'GET', body?: unknown) {
-  return fetch(`https://www.googleapis.com/calendar/v3/${path}`, { method, headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, ...(body ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(10000) });
+export async function calendarRequest(token: string, path: string, method = 'GET', body?: unknown, etag?: string) {
+  return fetch(`https://www.googleapis.com/calendar/v3/${path}`, { method, headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', ...(etag ? { 'If-Match': etag } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(10000) });
 }
 
 export async function ensureCalendar(env: Env, token: string) {
@@ -104,7 +106,18 @@ export function eventBody(task: Task) {
 export async function syncTask(env: Env, task: Task, token: string, calendar: string, update = false) {
   const eventId = task.id; // Hex is a valid subset of Google event ID alphabet.
   const path = `calendars/${encodeURIComponent(calendar)}/events`;
-  let response = await calendarRequest(token, update ? `${path}/${eventId}` : path, update ? 'PATCH' : 'POST', { ...eventBody(task), ...(!update ? { id: eventId } : {}) });
+  let etag: string | undefined;
+  if (update) {
+    const current = await calendarRequest(token, `${path}/${eventId}`);
+    if (!current.ok) throw new UserError('Could not read the current task event. Nothing was overwritten.');
+    const existing = await current.json() as { etag?: string; status?: string; extendedProperties?: { private?: { plannerTaskId?: string } } };
+    if (existing.status === 'cancelled' || existing.extendedProperties?.private?.plannerTaskId !== task.id || !existing.etag) throw new UserError('This event no longer matches the managed task. Nothing was overwritten.');
+    etag = existing.etag;
+  }
+  const body = eventBody(task);
+  // Task deadline changes must preserve user-added notes, location, guests, and reminders.
+  let response = await calendarRequest(token, update ? `${path}/${eventId}` : path, update ? 'PATCH' : 'POST', update ? { summary: body.summary, start: body.start, end: body.end } : { ...body, id: eventId }, etag);
+  if (response.status === 412) throw new UserError('The event changed while updating it. Please review it and try again.');
   if (!update && response.status === 409) response = await calendarRequest(token, `${path}/${eventId}`);
   if (!response.ok) {
     if ([401, 403, 404].includes(response.status)) throw new UserError('Calendar access or the event is unavailable. Reconnect with /connect and check the planner calendar.');

@@ -1,6 +1,6 @@
 import type { Env } from './types.ts';
-import { getSetting, openTasks } from './db.ts';
-import { addDays, localParts, stableId } from './time.ts';
+import { getSetting, openTasks, preferredTimezone } from './db.ts';
+import { addDays, localParts, stableId, formatDate, formatDeadline } from './time.ts';
 import { send } from './telegram.ts';
 
 export function inQuietHours(time: string, start?: string, end?: string) {
@@ -14,7 +14,8 @@ export async function scheduleBriefing(env: Env, now = Date.now()) {
   const local = localParts(now, rule.timezone);
   if (local.time < rule.time) return;
   const tasks = (await openTasks(env)).filter(t => t.due_date <= addDays(local.date, rule.days_ahead));
-  const text = tasks.length ? `Your task briefing — ${local.date}\n\n${tasks.map(t => `• ${t.title}: ${t.due_date}${t.due_time ? ' ' + t.due_time : ''} [${t.timezone}]${t.due_date < local.date ? ' — overdue' : ''}`).join('\n')}\n\nUse /tasks to mark items done.` : `Your task briefing — ${local.date}\nNo unfinished tasks due within ${rule.days_ahead} days.`;
+  const displayZone = await preferredTimezone(env);
+  const text = tasks.length ? `Your task briefing — ${formatDate(local.date)}\n\n${tasks.map(t => `• ${t.title}: ${formatDeadline(t.due_date, t.due_time, t.timezone, displayZone)}${t.due_date < local.date ? ' — overdue' : ''}`).join('\n')}\n\nUse /tasks to mark items done.` : `Your task briefing — ${formatDate(local.date)}\nNo unfinished tasks due within ${rule.days_ahead} days.`;
   await env.DB.prepare('INSERT OR IGNORE INTO reminders(id,text,due_at) VALUES (?,?,?)').bind(await stableId('briefing:' + local.date), text, now).run();
 }
 
@@ -28,7 +29,7 @@ export async function deliverReminders(env: Env, now = Date.now()) {
     if (!item) continue;
     if (item.task_id) {
       const task = await env.DB.prepare('SELECT status FROM tasks WHERE id=?').bind(item.task_id).first<{ status: string }>();
-      if (!task || task.status === 'done') {
+      if (!task || task.status !== 'open') {
         await env.DB.prepare("UPDATE reminders SET state='cancelled' WHERE id=?").bind(item.id).run();
         continue;
       }

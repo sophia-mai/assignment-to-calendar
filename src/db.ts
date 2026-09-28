@@ -1,4 +1,10 @@
 import type { Env, Task } from './types.ts';
+import { validZone } from './time.ts';
+
+export async function preferredTimezone(env: Env): Promise<string> {
+  const prefs = JSON.parse(await getSetting(env, 'preferences') ?? '{}');
+  return typeof prefs.timezone === 'string' && validZone(prefs.timezone) ? prefs.timezone : env.TIMEZONE;
+}
 
 export async function getSetting(env: Env, key: string): Promise<string | null> {
   const row = await env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind(key).first<{ value: string }>();

@@ -1,18 +1,18 @@
 import type { Env, Task } from './types.ts';
 import { UserError, ContinueWork } from './types.ts';
-import { ActionSchema, type Action, describeAction } from './actions.ts';
-import { getSetting, setSetting } from './db.ts';
+import { ActionSchema, type Action, describeAction, createdTaskId } from './actions.ts';
+import { getSetting, setSetting, preferredTimezone } from './db.ts';
 import { localInstant, stableId, validZone } from './time.ts';
 import { accessToken, ensureCalendar, syncTask } from './google.ts';
 import { send } from './telegram.ts';
-
-async function createdTaskId(action: Extract<Action, { type: 'create_task' }>) {
-  return stableId(JSON.stringify([action.title.trim().toLowerCase().replace(/\s+/g, ' '), action.due_date, action.due_time, action.timezone]));
-}
+import { selectedCalendars, prepareEdit, editPreview, applyEdit, checkDuplicates, type CalendarContext } from './calendar-tools.ts';
+import { prepareMutation, mutationPreview, applyMutation } from './event-mutations.ts';
+import { sessionInterval, checkSession, createSession } from './sessions.ts';
 
 export async function validateActions(env: Env, actions: Action[], start = 0) {
   for (let index = start; index < actions.length; index++) {
     const action = actions[index];
+    if (action.type === 'create_event') sessionInterval(action);
     if (action.type === 'create_task' || action.type === 'update_task') {
       if (action.due_time) localInstant(action.due_date, action.due_time, action.timezone);
     }
@@ -35,33 +35,72 @@ export async function validateActions(env: Env, actions: Action[], start = 0) {
 
 export async function makeProposal(env: Env, actions: Action[], sourceUpdate: number) {
   await validateActions(env, actions);
+  const mutations = actions.filter(a => ['rename_event', 'reschedule_event', 'delete_event'].includes(a.type));
+  if (mutations.length && actions.length !== 1) throw new UserError('Please rename, move, or delete one event per message.');
+  const edits = actions.filter(a => a.type === 'edit_event');
+  const sessions = actions.filter(a => a.type === 'create_event');
+  if (sessions.length && (sessions.length > 1 || actions.some(a => ['create_task', 'update_task', 'edit_event'].includes(a.type)))) throw new UserError('Please schedule one session per message, separately from assignment imports or calendar edits.');
+  for (const session of sessions) if (sessionInterval(session).start <= Date.now()) throw new UserError('That session would start in the past. Please choose a future date and time.');
+  if (edits.length > 1 || (edits.length && actions.some(a => a.type === 'create_task'))) throw new UserError('Please update one existing event per message, separately from new assignment imports. This keeps each preview clear and within the free hosting limits.');
+  const context: CalendarContext = { edits: {}, mutations: {} };
+  if (mutations.length || actions.some(a => a.type === 'create_task' || a.type === 'edit_event' || a.type === 'create_event')) {
+    const token = await accessToken(env);
+    const calendars = await selectedCalendars(env, token, mutations.length > 0);
+    await checkDuplicates(env, token, calendars, actions);
+    for (let i = 0; i < actions.length; i++) {
+      const action = actions[i];
+      if (action.type === 'rename_event' || action.type === 'reschedule_event' || action.type === 'delete_event') context.mutations![i] = await prepareMutation(env, token, calendars, action);
+      if (action.type === 'edit_event') context.edits![i] = await prepareEdit(env, token, calendars, action);
+      if (action.type === 'create_event') await checkSession(env, token, calendars, action);
+    }
+  }
   const id = await stableId('proposal:' + sourceUpdate);
-  await env.DB.prepare('INSERT OR IGNORE INTO proposals(id,actions,expires_at,created_at) VALUES (?,?,?,?)').bind(id, JSON.stringify(actions), Date.now() + 86400000, Date.now()).run();
+  await env.DB.prepare('INSERT OR IGNORE INTO proposals(id,actions,calendar_context,expires_at,created_at) VALUES (?,?,?,?,?)').bind(id, JSON.stringify(actions), JSON.stringify(context), Date.now() + 86400000, Date.now()).run();
   await showProposal(env, id, actions);
 }
 
 export async function showProposal(env: Env, id: string, actions: Action[]) {
-  await send(env, `Please review these changes. Nothing has been applied yet.\n\n${actions.map((action, i) => `${i + 1}. ${describeAction(action)}`).join('\n\n')}\n\nProposal expires after 24 hours.`, [[{ text: 'Confirm changes', callback_data: `approve:${id}` }, { text: 'Cancel', callback_data: `cancel:${id}` }]]);
+  const row = await env.DB.prepare('SELECT calendar_context,next_action,state FROM proposals WHERE id=?').bind(id).first<{ calendar_context: string; next_action: number; state: string }>();
+  const context: CalendarContext = JSON.parse(row?.calendar_context ?? '{}');
+  if (row?.state === 'done' || row?.state === 'cancelled') { await send(env, `This proposal is ${row.state}.`); return; }
+  const displayZone = await preferredTimezone(env);
+  await send(env, `Please review these changes.${row?.next_action ? ` The first ${row.next_action} changes are already applied.` : ' Nothing has been applied yet.'}\n\n${actions.map((action, i) => `${i + 1}. ${context.mutations?.[i] ? mutationPreview(context.mutations[i], displayZone) : context.edits?.[i] ? editPreview(context.edits[i], displayZone) : describeAction(action, displayZone)}`).join('\n\n')}\n\nProposal expires after 24 hours.`, [[{ text: actions.some(a => a.type === 'delete_event') ? 'Confirm deletion' : 'Confirm changes', callback_data: `approve:${id}` }, { text: 'Cancel', callback_data: `cancel:${id}` }]]);
 }
 
 export async function approve(env: Env, id: string) {
-  const proposal = await env.DB.prepare('SELECT * FROM proposals WHERE id=?').bind(id).first<{ actions: string; state: string; expires_at: number; next_action: number }>();
+  const proposal = await env.DB.prepare('SELECT * FROM proposals WHERE id=?').bind(id).first<{ actions: string; calendar_context: string; state: string; expires_at: number; next_action: number }>();
   if (!proposal) throw new UserError('Proposal not found.');
   if (proposal.state === 'done') { await send(env, 'These changes were already applied. /tasks shows the current list.'); return; }
   if (proposal.state === 'cancelled' || proposal.expires_at < Date.now()) throw new UserError('This proposal was cancelled or expired. Please send the request again.');
   const actions = JSON.parse(proposal.actions).map((a: unknown) => ActionSchema.parse(a)) as Action[];
   await validateActions(env, actions, proposal.next_action);
-  const needsCalendar = actions.slice(proposal.next_action).some(a => ['create_task', 'update_task'].includes(a.type));
+  const context: CalendarContext = JSON.parse(proposal.calendar_context ?? '{}');
+  const batch = actions.slice(proposal.next_action, proposal.next_action + 3);
+  const needsCalendar = batch.some(a => ['create_task', 'update_task', 'edit_event', 'create_event', 'rename_event', 'reschedule_event', 'delete_event'].includes(a.type));
   const token = needsCalendar ? await accessToken(env) : '';
-  const calendar = needsCalendar ? await ensureCalendar(env, token) : '';
+  if (batch.some(a => a.type === 'create_task')) await checkDuplicates(env, token, await selectedCalendars(env, token), batch);
+  for (const action of batch) if (action.type === 'create_event') {
+    if (sessionInterval(action).start <= Date.now()) throw new UserError('This session’s start time has passed. Check Calendar for any earlier successful attempt, then request a new time.');
+    await checkSession(env, token, await selectedCalendars(env, token), action);
+  }
+  const calendar = batch.some(a => ['create_task', 'update_task', 'create_event'].includes(a.type)) ? await ensureCalendar(env, token) : '';
   await env.DB.prepare("UPDATE proposals SET state='applying' WHERE id=?").bind(id).run();
   for (let i = proposal.next_action; i < Math.min(actions.length, proposal.next_action + 3); i++) {
     const action = actions[i];
     const actionId = await stableId(`${id}:${i}`);
-    if (action.type === 'create_task') {
+    if (action.type === 'rename_event' || action.type === 'reschedule_event' || action.type === 'delete_event') {
+      if (!context.mutations?.[i]) throw new UserError('This change has no reviewed event snapshot. Request a new preview.');
+      await applyMutation(env, token, context.mutations[i], actionId);
+    } else if (action.type === 'create_event') {
+      await createSession(token, calendar, action);
+    } else if (action.type === 'edit_event') {
+      if (!context.edits?.[i]) throw new UserError('This edit has no reviewed event snapshot. Please request a new preview.');
+      await applyEdit(env, token, context.edits[i], actionId);
+    } else if (action.type === 'create_task') {
       const taskId = await createdTaskId(action);
       await env.DB.prepare('INSERT OR IGNORE INTO tasks(id,title,due_date,due_time,timezone,source,created_at) VALUES (?,?,?,?,?,?,?)').bind(taskId, action.title, action.due_date, action.due_time, action.timezone, action.source, Date.now()).run();
       const task = (await env.DB.prepare('SELECT * FROM tasks WHERE id=?').bind(taskId).first<Task>())!;
+      if (task.status === 'cancelled') throw new UserError('This assignment was previously deleted. Please use a distinct title or date for a new assignment; the deleted event was not recreated.');
       if (!task.calendar_event_id) await syncTask(env, task, token, calendar);
     } else if (action.type === 'update_task') {
       const old = (await env.DB.prepare('SELECT * FROM tasks WHERE id=?').bind(action.task_id).first<Task>())!;
@@ -84,7 +123,11 @@ export async function approve(env: Env, id: string) {
   }
   if (proposal.next_action + 3 < actions.length) throw new ContinueWork();
   await env.DB.prepare("UPDATE proposals SET state='done' WHERE id=?").bind(id).run();
-  await send(env, 'Confirmed changes applied. Use /tasks to see your assignments and calendar links.');
+  const mutation = actions.find(a => ['rename_event', 'reschedule_event', 'delete_event'].includes(a.type));
+  if (mutation) { await send(env, mutation.type === 'delete_event' ? 'Confirmed — the event is removed from Google Calendar. Linked assignment reminders are cancelled; standalone reminders are unchanged.' : 'Confirmed — your event was updated in Google Calendar.'); return; }
+  const timezoneChange = actions.some(a => a.type === 'preference' && a.key === 'timezone');
+  if (timezoneChange) { await send(env, `Changes applied. Default timezone: ${await preferredTimezone(env)}. Future requests, displayed times, and quiet hours use this timezone. Existing events, reminders, daily briefings, and pending proposals keep their scheduled times.`); return; }
+  await send(env, actions.some(a => a.type === 'create_event') ? 'Confirmed — your session is scheduled in Assignment Planner. Open Google Calendar to view it. Sessions reserve time; they are not unfinished assignments in /tasks.' : 'Confirmed changes applied. Use /tasks to see your assignments and calendar links.');
 }
 
 export async function complete(env: Env, id: string) {

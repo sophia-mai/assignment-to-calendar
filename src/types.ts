@@ -1,5 +1,6 @@
 export interface Env {
   DB: D1Database;
+  INBOX_QUEUE?: Queue<{ wake: true }>;
   TELEGRAM_BOT_TOKEN: string;
   TELEGRAM_WEBHOOK_SECRET: string;
   ALLOWED_TELEGRAM_USER_ID: string;
@@ -17,6 +18,7 @@ export interface TelegramUpdate {
   update_id: number;
   message?: {
     message_id: number;
+    date?: number;
     from?: { id: number };
     chat: { id: number; type: string };
     text?: string;
@@ -28,7 +30,7 @@ export interface TelegramUpdate {
     id: string;
     from: { id: number };
     data?: string;
-    message?: { chat: { id: number; type: string } };
+    message?: { message_id?: number; chat: { id: number; type: string } };
   };
 }
 

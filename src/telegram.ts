@@ -13,7 +13,8 @@ export async function telegram<T>(env: Env, method: string, body: unknown): Prom
   const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(10000)
   });
-  const result = await response.json() as { ok: boolean; result: T };
+  const result = await response.json() as { ok: boolean; result: T; description?: string };
+  if (method === 'editMessageText' && response.status === 400 && result.description?.includes('message is not modified')) return result.result;
   if (!response.ok || !result.ok) throw new RetryLater(`Telegram request failed (${response.status}).`);
   return result.result;
 }

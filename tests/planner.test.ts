@@ -78,7 +78,9 @@ test('confirmed task creation is idempotent and new-task reminders cancel on com
   globalThis.fetch = async (input, init) => {
     const url = String(input);
     if (url.includes('oauth2.googleapis.com')) return Response.json({ access_token: 'access' });
+    if (url.includes('/calendarList')) return Response.json({ items: [{ id: 'primary', summary: 'Personal', primary: true, accessRole: 'owner', timeZone: 'America/New_York' }] });
     if (url.includes('/events')) {
+      if (!init?.method || init.method === 'GET') return Response.json({ items: [] });
       eventWrites++;
       const body = JSON.parse(init!.body as string);
       return Response.json({ id: body.id, htmlLink: 'https://calendar.google.com/event', extendedProperties: body.extendedProperties });
