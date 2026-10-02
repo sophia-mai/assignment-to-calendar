@@ -7,6 +7,7 @@ export interface Env {
   PUBLIC_BASE_URL: string;
   GEMINI_API_KEY: string;
   GEMINI_MODEL: string;
+  GEMINI_FALLBACK_MODEL?: string;
   GOOGLE_CLIENT_ID: string;
   GOOGLE_CLIENT_SECRET: string;
   TOKEN_ENCRYPTION_KEY: string;
@@ -48,4 +49,11 @@ export interface Task {
 
 export class UserError extends Error {}
 export class RetryLater extends Error {}
+export class AIError extends RetryLater {
+  code: string;
+  retryable: boolean;
+  constructor(code: string, message: string, retryable = false) {
+    super(message); this.code = code; this.retryable = retryable;
+  }
+}
 export class ContinueWork extends Error {}

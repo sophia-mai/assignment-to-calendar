@@ -1,5 +1,5 @@
 import type { Env, TelegramUpdate } from './types.ts';
-import { UserError, ContinueWork } from './types.ts';
+import { UserError, ContinueWork, AIError } from './types.ts';
 import { authorized, send } from './telegram.ts';
 import { claimLock, remember } from './db.ts';
 import { handleUpdate } from './bot.ts';
@@ -8,23 +8,34 @@ import { scheduleBriefing, deliverReminders } from './scheduler.ts';
 
 export async function processInbox(env: Env) {
   const now = Date.now();
-  const job = await env.DB.prepare("UPDATE inbox SET state='processing',lease_until=?,attempts=attempts+1 WHERE id=(SELECT id FROM inbox WHERE attempts<3 AND available_at<=? AND (state='queued' OR (state='processing' AND lease_until<?)) ORDER BY id LIMIT 1) RETURNING *").bind(now + 180000, now, now).first<{ id: number; payload: string; attempts: number }>();
+  const job = await env.DB.prepare("UPDATE inbox SET state='processing',lease_until=?,attempts=attempts+1 WHERE id=(SELECT id FROM inbox WHERE attempts<3 AND available_at<=? AND (state='queued' OR (state='processing' AND lease_until<?)) ORDER BY id LIMIT 1) RETURNING *").bind(now + 180000, now, now).first<{ id: number; payload: string; attempts: number; diagnostic: string }>();
   if (!job) return;
+  const previous = JSON.parse(job.diagnostic || '{}') as { code?: string };
+  const useFallback = job.attempts > 1 && env.GEMINI_FALLBACK_MODEL && /^(HTTP_5\d\d|NETWORK_TIMEOUT)$/.test(previous.code ?? '');
+  const attemptEnv = useFallback ? { ...env, GEMINI_MODEL: env.GEMINI_FALLBACK_MODEL! } : env;
   try {
-    await handleUpdate(env, JSON.parse(job.payload) as TelegramUpdate);
+    await handleUpdate(attemptEnv, JSON.parse(job.payload) as TelegramUpdate);
     await env.DB.prepare("UPDATE inbox SET state='done',payload='{}' WHERE id=?").bind(job.id).run();
   } catch (error) {
+    if (!(error instanceof ContinueWork)) {
+      const update = JSON.parse(job.payload) as TelegramUpdate;
+      const proposalId = update.callback_query?.data?.startsWith('approve:') ? update.callback_query.data.slice(8) : null;
+      const proposal = proposalId ? await env.DB.prepare('SELECT next_action,state FROM proposals WHERE id=?').bind(proposalId).first<{ next_action: number; state: string }>() : null;
+      const detail = error instanceof AIError ? error.message : error instanceof UserError ? error.message : 'A service or storage operation failed. Use /pending to inspect confirmed changes.';
+      const diagnostic = JSON.stringify({ model: error instanceof AIError ? attemptEnv.GEMINI_MODEL : undefined, stage: error instanceof AIError ? 'Understanding request' : proposalId ? 'Applying confirmed changes' : 'Processing request', code: error instanceof AIError ? error.code : error instanceof UserError ? 'REQUEST_REJECTED' : 'SERVICE_OR_STORAGE', detail, changes: error instanceof AIError ? 'None' : proposal ? proposal.state + '; ' + proposal.next_action + ' actions recorded; an interrupted action may also have applied' : 'Not verified; check /pending' });
+      await env.DB.prepare('UPDATE inbox SET diagnostic=? WHERE id=?').bind(diagnostic, job.id).run();
+    }
     if (error instanceof ContinueWork) {
       await env.DB.prepare("UPDATE inbox SET state='queued',attempts=0,available_at=?,lease_until=0 WHERE id=?").bind(Date.now() + 1000, job.id).run();
-    } else if (error instanceof UserError || job.attempts >= 3) {
+    } else if (error instanceof UserError || (error instanceof AIError && !error.retryable) || job.attempts >= 3) {
       if (error instanceof UserError) {
         await remember(env, 'assistant', error.message);
       }
-      try { await send(env, error instanceof UserError ? error.message : 'That request could not finish after retries. Some confirmed changes may have applied. Use /pending to review and resume.'); } catch { /* /pending retains proposals if Telegram is unavailable */ }
+      try { await send(env, error instanceof AIError ? `${error.message} Stopped after ${job.attempts} attempt(s). Use /diagnostics for details.` : error instanceof UserError ? error.message : 'That request could not finish after retries. Some confirmed changes may have applied. Use /pending to review and resume.'); } catch { /* /pending retains proposals if Telegram is unavailable */ }
       await env.DB.prepare("UPDATE inbox SET state='failed',payload='{}' WHERE id=?").bind(job.id).run();
     } else {
       if (job.attempts === 1) {
-        try { await send(env, 'A service is taking longer than expected. Your request is saved and I will retry automatically.'); } catch { /* Durable inbox retains the request. */ }
+        try { await send(env, error instanceof AIError ? `${error.message} ${env.GEMINI_FALLBACK_MODEL ? `I will try ${env.GEMINI_FALLBACK_MODEL} next.` : "I will retry automatically."} Up to 3 total attempts within your daily AI cap. Use /diagnostics for progress.` : 'A service is taking longer than expected. Your request is saved and I will retry automatically.'); } catch { /* Durable inbox retains the request. */ }
       }
       await env.DB.prepare("UPDATE inbox SET state='queued',available_at=?,lease_until=0 WHERE id=?").bind(now + 60000 * job.attempts, job.id).run();
     }
@@ -56,6 +67,7 @@ export async function tick(env: Env) {
     await env.DB.batch([
       env.DB.prepare('DELETE FROM oauth_states WHERE expires_at<?').bind(Date.now()),
       env.DB.prepare("DELETE FROM inbox WHERE state IN ('done','failed') AND created_at<?").bind(Date.now() - 7 * 86400000),
+      env.DB.prepare('DELETE FROM ai_attempts WHERE created_at<?').bind(Date.now() - 7 * 86400000),
       env.DB.prepare('DELETE FROM usage WHERE day<?').bind(new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10)),
       env.DB.prepare('DELETE FROM proposals WHERE expires_at<?').bind(Date.now() - 7 * 86400000)
     ]);

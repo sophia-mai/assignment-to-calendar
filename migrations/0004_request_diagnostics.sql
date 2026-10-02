@@ -1,0 +1,1 @@
+ALTER TABLE inbox ADD COLUMN diagnostic TEXT NOT NULL DEFAULT '';

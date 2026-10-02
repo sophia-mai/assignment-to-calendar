@@ -1,13 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import worker from '../src/index.ts';
+import worker, { processInbox } from '../src/index.ts';
+import { handleUpdate } from '../src/bot.ts';
 import { fixture } from './helpers.ts';
 import { setSetting, getSetting } from '../src/db.ts';
 import { seal } from '../src/google.ts';
 import { calendarMenu, selectedCalendars, listEvents, checkDuplicates, type Calendar } from '../src/calendar-tools.ts';
 import { stableId } from '../src/time.ts';
 import { makeProposal, approve } from '../src/planner.ts';
-import { sessionInterval } from '../src/sessions.ts';
+import { sessionInterval, firstAvailableSession } from '../src/sessions.ts';
 import { interpret } from '../src/ai.ts';
 import { planJsonSchema, type Action } from '../src/actions.ts';
 
@@ -131,6 +132,7 @@ test('study sessions reserve the full interval only after confirmation and recov
   const original = globalThis.fetch;
   t.after(() => { globalThis.fetch = original; });
   let saved: any, inserts = 0;
+  const confirmations: string[] = [];
   globalThis.fetch = async (input, init) => {
     const url = String(input);
     if (url.includes('oauth2')) return Response.json({ access_token: 'access' });
@@ -143,6 +145,7 @@ test('study sessions reserve the full interval only after confirmation and recov
     }
     if (url.includes('/events/')) return Response.json(saved);
     if (url.includes('googleapis')) return Response.json({ id: 'planner' });
+    if (url.includes('sendMessage')) confirmations.push(JSON.parse(init!.body as string).text);
     return Response.json({ ok: true, result: {} });
   };
   await makeProposal(env, [session], 20);
@@ -154,6 +157,8 @@ test('study sessions reserve the full interval only after confirmation and recov
   assert.equal(saved.start.dateTime, '2099-10-08T17:00:00.000Z');
   assert.equal(saved.transparency, 'opaque');
   assert.equal(saved.location, 'Library');
+  assert.ok(confirmations.some(text => text.includes('https://calendar.google.com/test')));
+  assert.equal(JSON.parse(sql.prepare('SELECT calendar_context FROM proposals WHERE id=?').get(id)!.calendar_context as string).sessionLinks['0'], saved.htmlLink);
   assert.equal(sql.prepare('SELECT COUNT(*) AS n FROM tasks').get()!.n, 0);
   sql.prepare("UPDATE proposals SET next_action=0,state='applying'").run();
   await approve(env, id);
@@ -194,4 +199,165 @@ test('AI timeout gets an actionable reply and relative-date prompt uses original
     throw new DOMException('Timed out', 'TimeoutError');
   };
   await assert.rejects(interpret(env, { ...message, date: Date.parse('2026-09-27T18:00:00Z') / 1000, text: 'Study group tomorrow 1-2pm' }), /did not respond in time/);
+});
+
+
+test('temporary AI failures retry three times, retain safe diagnostics, and respect daily budget', async t => {
+  const { env, sql } = fixture();
+  env.AI_DAILY_LIMIT = '3';
+  env.GEMINI_FALLBACK_MODEL = 'fallback-test';
+  const original = globalThis.fetch;
+  t.after(() => { globalThis.fetch = original; sql.close(); });
+  const messages: string[] = [];
+  let calls = 0;
+  globalThis.fetch = async (input, init) => {
+    if (String(input).includes('generativelanguage')) { calls++; assert.ok(String(input).includes(calls === 1 ? '/test:' : '/fallback-test:')); return Response.json({ error: { message: 'private-provider-detail' } }, { status: 503 }); }
+    assert.ok(String(input).includes('api.telegram.org'));
+    messages.push(JSON.parse(init!.body as string).text);
+    return Response.json({ ok: true, result: {} });
+  };
+  const update = { update_id: 900, message: { ...message, text: 'Add lab meeting tomorrow 7pm to 8pm' } };
+  sql.prepare('INSERT INTO inbox(id,payload,available_at,created_at) VALUES (900,?,0,?)').run(JSON.stringify(update), Date.now());
+  for (let i = 1; i <= 3; i++) {
+    sql.prepare('UPDATE inbox SET available_at=0 WHERE id=900').run();
+    await processInbox(env);
+    const row = sql.prepare('SELECT state,attempts,diagnostic FROM inbox WHERE id=900').get()!;
+    assert.equal(row.state, i < 3 ? 'queued' : 'failed');
+    assert.equal(row.attempts, i);
+    assert.match(row.diagnostic as string, /HTTP_503/);
+    assert.doesNotMatch(row.diagnostic as string, /private-provider-detail/);
+  }
+  await handleUpdate(env, { update_id: 901, message: { ...message, text: '/diagnostics' } });
+  assert.match(messages.at(-1)!, /Understanding request/);
+  assert.match(messages.at(-1)!, /Changes at failure: None/);
+  assert.equal(calls, 3);
+  await assert.rejects(interpret(env, update.message), /daily AI limit/);
+  assert.equal(calls, 3);
+  assert.equal(sql.prepare('SELECT COUNT(*) AS count FROM proposals').get()!.count, 0);
+});
+
+test('AI access and quota failures stop without retrying', async t => {
+  const { env, sql } = fixture(); env.AI_DAILY_LIMIT = '3';
+  const original = globalThis.fetch;
+  t.after(() => { globalThis.fetch = original; sql.close(); });
+  for (const status of [403, 429]) {
+    globalThis.fetch = async input => String(input).includes('generativelanguage') ? Response.json({}, { status }) : Response.json({ ok: true, result: {} });
+    sql.prepare('INSERT INTO inbox(id,payload,available_at,created_at) VALUES (?, ?,0,?)').run(status, JSON.stringify({ update_id: status, message: { ...message, text: 'Schedule lab tomorrow 7pm to 8pm' } }), Date.now());
+    await processInbox(env);
+    assert.equal(sql.prepare('SELECT state FROM inbox WHERE id=?').get(status)!.state, 'failed');
+  }
+});
+
+
+test('first available slot merges busy intervals, ignores free events, checks planner and fails when full', async t => {
+  const { env, sql } = fixture();
+  await setSetting(env, 'google_refresh_token', await seal(env, 'refresh'));
+  await setSetting(env, 'calendar_id', 'planner');
+  const original = globalThis.fetch;
+  t.after(() => { globalThis.fetch = original; sql.close(); });
+  let full = false;
+  const scanned: string[] = [];
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    assert.ok(!init?.method || init.method === 'GET' || url.includes('oauth2') || url.includes('telegram.org') || url.includes('generativelanguage'), 'slot search must not create events');
+    if (url.includes('oauth2')) return Response.json({ access_token: 'access' });
+    if (url.includes('/calendarList')) return Response.json({ items: [calendars[0], { id: 'planner', summary: 'Planner', accessRole: 'owner' }] });
+    if (url.includes('/events?')) {
+      scanned.push(url);
+      const interval = (id: string, start: string, end: string, extra = {}) => ({ id, start: { dateTime: '2099-10-08T' + start + ':00-04:00' }, end: { dateTime: '2099-10-08T' + end + ':00-04:00' }, ...extra });
+      return Response.json({ items: full ? [{ id: 'all', start: { date: '2099-10-08' }, end: { date: '2099-10-09' } }] : [interval('one', '09:00', '10:00'), interval('two', '09:30', '10:30'), interval('free', '10:30', '11:00', { transparency: 'transparent' }), interval('next', '11:00', '12:00')] });
+    }
+    if (url.includes('generativelanguage')) return Response.json({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: JSON.stringify({ reply: 'Finding a slot', needs_clarification: false, actions: [request] }) }] } }] });
+    if (url.includes('telegram.org')) return Response.json({ ok: true, result: {} });
+    throw Error('Unexpected call');
+  };
+  const request: Extract<Action, { type: 'find_slot' }> = { type: 'find_slot', title: 'Homework review', date_from: '2099-10-08', date_to: '2099-10-08', time: null, end_time: null, duration_minutes: 30, timezone: 'America/New_York', description: '', location: null };
+  const result = await firstAvailableSession(env, request);
+  assert.equal(result.time, '10:30'); assert.equal(result.end_time, '11:00');
+  assert.ok(scanned.some(url => url.includes('/planner/')));
+  assert.equal(sql.prepare('SELECT COUNT(*) AS n FROM proposals').get()!.n, 0);
+  await handleUpdate(env, { update_id: 987, message: { ...message, text: 'Find the first free 30 minutes to review homework' } });
+  const proposed = JSON.parse(sql.prepare('SELECT actions FROM proposals').get()!.actions as string);
+  assert.equal(proposed[0].type, 'create_event');
+  assert.equal(proposed[0].time, '10:30');
+  full = true;
+  await assert.rejects(firstAvailableSession(env, request), /No free 30-minute slot/);
+  await assert.rejects(firstAvailableSession(env, { ...request, date_to: '2099-10-15' }), /at most seven/);
+});
+
+
+test('named destination is reviewed, used for writes, and loss of access never redirects', async t => {
+  const { env, sql } = fixture();
+  await setSetting(env, 'google_refresh_token', await seal(env, 'refresh'));
+  const original = globalThis.fetch;
+  t.after(() => { globalThis.fetch = original; sql.close(); });
+  let accessible = true, writes = 0;
+  const texts: string[] = [];
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    if (url.includes('oauth2')) return Response.json({ access_token: 'access' });
+    if (url.includes('/calendarList')) return Response.json({ items: [calendars[0], ...(accessible ? [{ id: 'jhu', summary: 'JHU Events', accessRole: 'owner' }] : [])] });
+    if (url.includes('/events?')) return Response.json({ items: [] });
+    if (url.includes('googleapis') && init?.method === 'POST') {
+      assert.ok(url.includes('/calendars/jhu/events'));
+      writes++;
+      return Response.json({ ...JSON.parse(init.body as string), htmlLink: 'https://calendar.google.com/named' });
+    }
+    if (url.includes('telegram.org')) { texts.push(JSON.parse(init!.body as string).text); return Response.json({ ok: true, result: {} }); }
+    throw Error('Unexpected call');
+  };
+  await makeProposal(env, [{ ...session, calendar_name: 'jhu events' }], 920);
+  const row = sql.prepare('SELECT id,calendar_context FROM proposals').get()!;
+  assert.equal(JSON.parse(row.calendar_context as string).destinations['0'].id, 'jhu');
+  assert.ok(texts.some(s => s.includes('Calendar: JHU Events')));
+  accessible = false;
+  await assert.rejects(approve(env, row.id as string), /no longer owned or accessible/);
+  assert.equal(writes, 0);
+  accessible = true;
+  await approve(env, row.id as string);
+  assert.equal(writes, 1);
+  assert.ok(texts.some(s => s.includes('scheduled in JHU Events')));
+  assert.equal(await getSetting(env, 'calendar_id'), null);
+  await assert.rejects(makeProposal(env, [{ ...session, calendar_name: 'Unknown calendar' }], 921), /No owned calendar matches/);
+});
+
+
+test('two events from one model plan share a preview and resume a failed second write without duplicates', async t => {
+  const { env, sql } = fixture();
+  await setSetting(env, 'google_refresh_token', await seal(env, 'refresh'));
+  const original = globalThis.fetch;
+  t.after(() => { globalThis.fetch = original; sql.close(); });
+  const events = [{ ...session, title: 'Workshop', calendar_name: 'JHU Events' }, { ...session, title: 'Dinner', date: '2099-10-09', end_date: '2099-10-09', calendar_name: 'JHU Events' }];
+  const stored = new Map<string, any>(); let fail = true, inserts = 0;
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    if (url.includes('generativelanguage')) return Response.json({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: JSON.stringify({ reply: 'Review both events', needs_clarification: false, actions: events }) }] } }] });
+    if (url.includes('oauth2')) return Response.json({ access_token: 'access' });
+    if (url.includes('/calendarList')) return Response.json({ items: [{ ...calendars[0], id: 'jhu', summary: 'JHU Events' }] });
+    if (url.includes('/events?')) return Response.json({ items: [...stored.values()] });
+    if (url.endsWith('/events') && init?.method === 'POST') {
+      assert.ok(url.includes('/calendars/jhu/events'));
+      const body = JSON.parse(init.body as string);
+      if (body.summary === 'Dinner' && fail) return new Response('', { status: 503 });
+      if (stored.has(body.id)) return new Response('', { status: 409 });
+      inserts++; stored.set(body.id, { ...body, htmlLink: 'https://calendar.google.com/' + body.id });
+      return Response.json(stored.get(body.id));
+    }
+    if (url.includes('/events/')) return Response.json(stored.get(url.split('/').at(-1)!));
+    if (url.includes('telegram.org')) return Response.json({ ok: true, result: {} });
+    throw Error('Unexpected request');
+  };
+  await handleUpdate(env, { update_id: 995, message: { ...message, text: 'Add these two events in JHU Events' } });
+  const proposal = sql.prepare('SELECT id,actions FROM proposals').get()!;
+  assert.equal(JSON.parse(proposal.actions as string).length, 2);
+  assert.equal(inserts, 0);
+  await assert.rejects(approve(env, proposal.id as string), e => e instanceof Error && e.constructor.name === 'ContinueWork');
+  assert.equal(inserts, 1);
+  await assert.rejects(approve(env, proposal.id as string), /temporarily unavailable/);
+  assert.equal(sql.prepare('SELECT next_action FROM proposals').get()!.next_action, 1);
+  fail = false;
+  await approve(env, proposal.id as string);
+  await approve(env, proposal.id as string);
+  assert.equal(inserts, 2);
+  assert.equal(sql.prepare('SELECT state FROM proposals').get()!.state, 'done');
 });

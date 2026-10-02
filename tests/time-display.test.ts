@@ -103,3 +103,28 @@ test('saved timezone is the actual default passed to the model', async t => {
   };
   await interpret(env, { message_id: 1, chat: { id: 123, type: 'private' }, text: 'What timezone am I using?' });
 });
+
+
+test('reminders list uses saved timezone, excludes inactive reminders, and explains Telegram delivery', async t => {
+  const { env, sql } = fixture();
+  const original = globalThis.fetch;
+  t.after(() => { globalThis.fetch = original; sql.close(); });
+  const messages: string[] = [];
+  globalThis.fetch = async (input, init) => {
+    assert.ok(String(input).includes('api.telegram.org'));
+    messages.push(JSON.parse(init!.body as string).text);
+    return Response.json({ ok: true, result: {} });
+  };
+  await setSetting(env, 'preferences', JSON.stringify({ timezone: 'Europe/London' }));
+  const update = { update_id: 1, message: { message_id: 1, chat: { id: 123, type: 'private' }, text: '/reminders' } };
+  await handleUpdate(env, update);
+  assert.match(messages.at(-1)!, /No upcoming Telegram reminders/);
+  for (const [id, state] of [['active', 'pending'], ['old', 'sent'], ['cancelled', 'cancelled']]) {
+    sql.prepare('INSERT INTO reminders(id,text,due_at,state) VALUES (?,?,?,?)').run(id, id + ' reminder', Date.parse('2099-01-01T20:00:00Z'), state);
+  }
+  await handleUpdate(env, update);
+  assert.match(messages.at(-1)!, /active reminder/);
+  assert.match(messages.at(-1)!, /8:00pm GMT/);
+  assert.match(messages.at(-1)!, /here in this chat/);
+  assert.doesNotMatch(messages.at(-1)!, /old reminder|cancelled reminder/);
+});

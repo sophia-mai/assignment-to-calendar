@@ -68,9 +68,11 @@ Follow [docs/SETUP.md](docs/SETUP.md) to configure the four service accounts and
 | `/start`, `/help` | Usage and sample requests |
 | `/connect` | One-time Google authorization link |
 | `/calendars` | Select/deselect owned calendars for searches and existing-event edits |
+| `/reminders` | Upcoming reminders sent in this Telegram chat; no calendar event is created |
 | `/tasks` | Open tasks, calendar links, Done buttons for the first 20 |
 | `/pending` | Up to three pending/partially applied proposals |
 | `/settings` | Stored preferences and daily briefing rule |
+| `/diagnostics` | Recent failure reasons, processing step, retry attempts, and recorded changes |
 | `/status` | Connection state, daily AI attempts, failed-reminder count |
 | `/stop` | Disable briefing and cancel pending reminders |
 | `/reset` | Clear recent conversation and pending attachment |
@@ -143,3 +145,15 @@ Mutations use the reviewed ETag with If-Match; changes made after review require
 When a poster contains multiple possible dates (such as an event and its submission deadline), the bot asks which item to add and requests missing year/time details. It asks at most two focused questions at a time. Invalid structured output safely becomes a clarification with no executable actions, rather than blaming image quality. A question accompanied by tentative model actions discards those actions. This recovery uses no additional model call.
 
 Telegram attachment references and original caption/date are retained for up to 24 hours after the latest interaction, including provider quota errors/timeouts, so the user can answer without re-uploading. Original file bytes are not saved. New uploads replace that context, completed interpretation clears it, and `/reset` clears it manually. Provider quota/connection errors remain explicit errors rather than misleading clarification questions.
+
+## Find the first available time
+
+Ask “Find the first free 30 minutes today to review my homework.” The bot scans selected calendars plus Assignment Planner and previews the earliest future gap. Omitted hours default to 9am–9pm in your timezone; specify a different window if desired. Searches cover at most seven dates and durations up to 12 hours. Busy all-day events block availability; transparent or declined events do not. Confirm the concrete preview to create the event; conflicts are checked again then. If no gap fits, nothing is created. Overnight daily windows must be split into separate searches.
+
+## Choose an event calendar
+
+Ask “Schedule the workshop on October 5 from 7pm to 9pm in my JHU Events calendar.” New timed events and first-available-slot searches accept an explicit owned calendar name. The preview displays the resolved destination; confirmation checks that it is still accessible and writes to that same calendar. Missing or ambiguous names require clarification and never fall back to primary. Without a destination, events still go into Assignment Planner. This does not change `/calendars` conflict-selection settings. Assignment deadlines still use Assignment Planner. Up to ten events can share a request and preview. Conflicts still block creation. Shared calendars with writer-only access are not supported by the current owned-event permissions.
+
+## Multiple events from one screenshot
+
+Send one image with “Add both events to JHU Events.” One model response can extract up to ten separate events; review all dates, times, locations, and destinations before confirming once. The bot scans availability for the combined window (at most one year), then checks and creates each event in a separate queue invocation. Each successful event is checkpointed and reported with its link. If processing stops, `/pending` resumes the remaining changes without recreating saved events. Overlaps between proposed events or existing busy events still block scheduling; conflict overrides are not implemented.

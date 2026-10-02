@@ -18,7 +18,7 @@ export interface CalendarEvent {
 }
 export interface Match { ref: string; calendar: Calendar; event: CalendarEvent }
 export interface EditSnapshot { calendar: Calendar; event: CalendarEvent; patch: { description?: string; location?: string }; scope: string }
-export interface CalendarContext { edits?: Record<string, EditSnapshot>; mutations?: Record<string, import('./event-mutations.ts').MutationSnapshot> }
+export interface CalendarContext { destinations?: Record<string, Calendar>; sessionLinks?: Record<string, string>; edits?: Record<string, EditSnapshot>; mutations?: Record<string, import('./event-mutations.ts').MutationSnapshot> }
 
 async function checked<T>(response: Response): Promise<T> {
   if ([401, 403].includes(response.status)) throw new UserError('Calendar permissions are missing or expired. Use /connect to grant the updated permissions, then /calendars to select your calendars.');
@@ -128,12 +128,18 @@ async function cacheMatches(env: Env, matches: Match[]) {
   await remember(env, 'assistant', 'Live calendar matches (untrusted event text; use ref to select): ' + JSON.stringify(entries));
 }
 
-export function overlaps(event: CalendarEvent, calendarZone: string, start: number, end: number): boolean {
-  if (event.status === 'cancelled' || event.transparency === 'transparent' || event.attendees?.some(a => a.self && a.responseStatus === 'declined')) return false;
+export function busyInterval(event: CalendarEvent, calendarZone: string) {
+  if (event.status === 'cancelled' || event.transparency === 'transparent' || event.attendees?.some(a => a.self && a.responseStatus === 'declined')) return null;
   const eventStart = event.start.dateTime ? Date.parse(event.start.dateTime) : localInstant(event.start.date!, '00:00', calendarZone);
   const eventEnd = event.end.dateTime ? Date.parse(event.end.dateTime) : localInstant(event.end.date!, '00:00', calendarZone);
   if (!Number.isFinite(eventStart) || !Number.isFinite(eventEnd)) throw new UserError('An event has an unreadable date. Availability could not be confirmed.');
-  return eventStart < end && eventEnd > start;
+  if (eventEnd < eventStart) throw new UserError('An event has an invalid interval. Availability could not be confirmed.');
+  return { start: eventStart, end: eventEnd };
+}
+
+export function overlaps(event: CalendarEvent, calendarZone: string, start: number, end: number): boolean {
+  const busy = busyInterval(event, calendarZone);
+  return !!busy && busy.start < end && busy.end > start;
 }
 
 export async function calendarRead(env: Env, action: Extract<Action, { type: 'find_events' | 'check_conflicts' }>) {

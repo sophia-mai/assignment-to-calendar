@@ -17,7 +17,7 @@ Run `node scripts/telegram-user-id.mjs` after sending `/start` to print only sen
 1. Create a Gemini API key in [Google AI Studio](https://aistudio.google.com/apikey).
 2. Choose a project on the **free tier without paid billing**. Do not enable automatic paid fallback or attach billing for this app.
 3. Store the key in `GEMINI_API_KEY`.
-4. Check that the configured `GEMINI_MODEL` in `wrangler.jsonc` is available on your account's free tier and supports images, PDFs, and structured output. The initial default is `gemini-2.5-flash`; availability and quotas can change. Change the model configuration if necessary before live testing.
+4. Check that the configured `GEMINI_MODEL` in `wrangler.jsonc` is available on your account's free tier and supports images, PDFs, and structured output. The default is `gemini-3.1-flash-lite`; availability and quotas can change. Change the model configuration if necessary before live testing.
 5. Keep `AI_DAILY_LIMIT` at 15 or lower initially. This application cap is additional to Google's limits.
 
 Read [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing) and [data-use terms](https://ai.google.dev/gemini-api/terms) before sending personal documents.
@@ -135,3 +135,13 @@ Send `/calendars` for a fresh menu. Select more than five calendars (up to 20), 
 ## Live edit/delete acceptance check
 
 Use a disposable event you create yourself. Ask the bot to rename it, verify the exact title/date/calendar preview, and confirm. Ask to move it to a free interval, then repeat with a conflicting interval and verify the latter is blocked at confirmation. Ask to delete it and test Cancel first, then request again and confirm deletion. Modify an event manually after its preview and verify the bot refuses the stale change. For recurring events, confirm that it asks one occurrence versus the entire series. Renaming/deleting a whole series is supported; moving a whole series or an all-day event is not. Standalone reminders keep their original schedule.
+
+## Upgrade: AI retries and diagnostics
+
+Apply migration `0004_request_diagnostics.sql` using `npm run db:remote -- --config wrangler.local.jsonc` before deploying. The configured model is now `gemini-3.1-flash-lite`; update your ignored local config too. Temporary AI failures retry through the existing queue at most three times (one and two minute delays), counting every attempt against the daily AI cap. Quota and access errors stop immediately. `/diagnostics` displays recent failures for up to seven days without making AI calls; it never displays API keys or raw provider responses. Calendar confirmations include returned event links when available. No billing upgrade or automatic paid fallback is configured.
+
+Temporary AI errors (HTTP 5xx or network timeout) switch subsequent queue attempts to `GEMINI_FALLBACK_MODEL` (`gemini-3.5-flash-lite`). The primary remains `gemini-3.1-flash-lite`. The three-attempt limit is shared across both models, and each attempt counts against the same daily cap. Quota/access errors, invalid output, and Calendar failures do not trigger model switching. Configure only models available on your account's free tier; this setting does not change billing. Existing failed requests must be resent.
+
+## Upgrade: clarification context and attempt history
+
+Apply `0005_ai_attempts.sql` before deploying. `/diagnostics` shows the last ten model attempts with request ID, model, elapsed time, and outcome; records expire after seven days. Attempt records contain no prompts, API keys, or raw responses. Pending text requests now use the same 24-hour context as uploads, retain up to six follow-ups, and clear after a successful preview/read or `/reset`. AI-only replies are limited to clarification questions; completed-action confirmations come from application handlers. Retry limits and the daily cap are unchanged.

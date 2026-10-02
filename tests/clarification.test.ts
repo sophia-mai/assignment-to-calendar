@@ -69,3 +69,44 @@ test('quota failure preserves file metadata and is not misreported as an ambiguo
   assert.equal(saved.photo[0].file_id, 'saved');
   assert.equal(saved.request, 'Add the deadline');
 });
+
+
+test('clarifications cannot forward the model success statement from the reported conversation', () => {
+  for (const needs_clarification of [true, false]) {
+    const plan = parseModelPlan(JSON.stringify({ reply: 'I have scheduled your lab meeting for tomorrow. Since September only has 30 days, did you mean October 1st instead?', needs_clarification, actions: [] }), false);
+    assert.doesNotMatch(plan.reply, /I have scheduled/);
+    assert.equal(plan.needs_clarification, true);
+    assert.equal(plan.actions.length, 0);
+  }
+});
+
+test('text clarification survives a provider failure and bounded-history eviction', async t => {
+  const { env, sql } = fixture(); env.AI_DAILY_LIMIT = '5';
+  const original = globalThis.fetch;
+  t.after(() => { globalThis.fetch = original; sql.close(); });
+  let calls = 0;
+  globalThis.fetch = async (input, init) => {
+    if (String(input).includes('generativelanguage')) {
+      calls++;
+      const prompt = JSON.parse(init!.body as string).systemInstruction.parts[0].text;
+      if (calls > 1) assert.match(prompt, /lab meeting.*7pm.*8pm/);
+      if (calls === 2) return Response.json({}, { status: 503 });
+      if (calls === 3) assert.match(prompt, /October 1st/);
+      return Response.json({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: JSON.stringify({ reply: 'Did you mean October 1st?', needs_clarification: true, actions: [] }) }] } }] });
+    }
+    assert.ok(String(input).includes('api.telegram.org'));
+    return Response.json({ ok: true, result: {} });
+  };
+  const base = { chat: { id: 123, type: 'private' }, date: 1790784000 };
+  await handleUpdate(env, { update_id: 1, message: { ...base, message_id: 1, text: 'Add lab meeting on September 31st from 7pm to 8pm' } });
+  sql.prepare('DELETE FROM history').run();
+  const answer = { update_id: 2, message: { ...base, message_id: 2, text: 'Yes October 1st' } };
+  await assert.rejects(handleUpdate(env, answer), /temporarily unavailable/);
+  await handleUpdate(env, answer);
+  const saved = JSON.parse(sql.prepare("SELECT value FROM settings WHERE key='pending_attachment'").get()!.value as string);
+  assert.equal(saved.answers.length, 1);
+  const attempts = sql.prepare('SELECT outcome,duration_ms,request_id FROM ai_attempts ORDER BY id').all();
+  assert.deepEqual(attempts.map(a => a.outcome), ['CLARIFICATION', 'HTTP_503', 'CLARIFICATION']);
+  assert.ok(attempts.every(a => Number(a.duration_ms) >= 0));
+  assert.equal(attempts[2].request_id, 2);
+});
